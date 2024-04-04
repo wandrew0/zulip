@@ -5,6 +5,7 @@ import smtplib
 from contextlib import suppress
 from datetime import timedelta
 from email.headerregistry import Address
+from email.message import Message
 from email.parser import Parser
 from email.policy import default
 from email.utils import formataddr, parseaddr
@@ -30,9 +31,10 @@ from django.utils.translation import override as override_language
 
 from confirmation.models import generate_key
 from zerver.lib.logging_util import log_to_file
-from zerver.models import Realm, ScheduledEmail, UserProfile
+from zerver.models import Realm, RealmAuditLog, ScheduledEmail, UserProfile
+from zerver.models.realms import get_realm_by_id
 from zerver.models.scheduled_jobs import EMAIL_TYPES
-from zerver.models.users import get_user_profile_by_id
+from zerver.models.users import get_user_by_delivery_email, get_user_profile_by_id
 from zproject.email_backends import EmailLogBackEnd, get_forward_address
 
 if settings.ZILENCER_ENABLED:
@@ -514,6 +516,14 @@ def get_header(option: Optional[str], header: Optional[str], name: str) -> str:
     return str(option or header)
 
 
+def parse_email_template(template: str) -> Tuple[Message, str]:
+    with open(template) as f:
+        text = f.read()
+        message = Parser(policy=default).parsestr(text)
+        hash_code = hashlib.sha256(text.encode()).hexdigest()[0:32]
+        return message, hash_code
+
+
 def custom_email_sender(
     markdown_template_path: str,
     dry_run: bool,
@@ -523,11 +533,7 @@ def custom_email_sender(
     reply_to: Optional[str] = None,
     **kwargs: Any,
 ) -> Callable[..., None]:
-    with open(markdown_template_path) as f:
-        text = f.read()
-        parsed_email_template = Parser(policy=default).parsestr(text)
-        email_template_hash = hashlib.sha256(text.encode()).hexdigest()[0:32]
-
+    parsed_email_template, email_template_hash = parse_email_template(markdown_template_path)
     email_id = f"zerver/emails/custom/custom_email_{email_template_hash}"
     markdown_email_base_template_path = "templates/zerver/emails/custom_email_base.pre.html"
     html_template_path = f"templates/{email_id}.html"
@@ -562,17 +568,51 @@ def custom_email_sender(
         context: Dict[str, Any], to_user_id: Optional[int] = None, to_email: Optional[str] = None
     ) -> None:
         assert to_user_id is not None or to_email is not None
-        with suppress(EmailNotDeliveredError):
-            send_email(
-                email_id,
-                to_user_ids=[to_user_id] if to_user_id is not None else None,
-                to_emails=[to_email] if to_email is not None else None,
-                from_address=from_address,
-                reply_to_email=reply_to,
-                from_name=get_header(from_name, parsed_email_template.get("from"), "from_name"),
-                context=context,
-                dry_run=dry_run,
+        now = timezone_now()
+        one_week_ago = now - timedelta(weeks=1)
+        skip = False
+
+        # if email address is mapped to a UserProfile that the same email content
+        # was sent successfully before, we skip sending the email also.
+        if to_user_id is None and to_email is not None and context.get("realm") is not None:
+            user_realm = get_realm_by_id(context["realm"])
+            if user_realm is not None:
+                user = get_user_by_delivery_email(to_email, user_realm)
+                if user is not None:
+                    to_user_id = user.id
+
+        if to_user_id is not None:
+            past_events = RealmAuditLog.objects.filter(
+                realm_id=context["realm"],
+                event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+                event_time__gte=one_week_ago,
+                acting_user_id=to_user_id,
             )
+
+            for event in past_events:
+                if event.extra_data["email_id"] == email_id:
+                    skip = True
+                    break
+        if not skip:
+            with suppress(EmailNotDeliveredError):
+                send_email(
+                    email_id,
+                    to_user_ids=[to_user_id] if to_user_id is not None else None,
+                    to_emails=[to_email] if to_email is not None else None,
+                    from_address=from_address,
+                    reply_to_email=reply_to,
+                    from_name=get_header(from_name, parsed_email_template.get("from"), "from_name"),
+                    context=context,
+                    dry_run=dry_run,
+                )
+            if to_user_id is not None:
+                RealmAuditLog.objects.create(
+                    realm=context["realm"],
+                    event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+                    extra_data={"email_id": email_id},
+                    acting_user_id=to_user_id,
+                    event_time=now,
+                )
 
     return send_one_email
 

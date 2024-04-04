@@ -1,6 +1,7 @@
+import random
 import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Optional
 from unittest.mock import patch
 
 import ldap
@@ -18,11 +19,12 @@ from zerver.lib.email_notifications import (
 )
 from zerver.lib.send_email import (
     deliver_scheduled_emails,
+    parse_email_template,
     send_custom_email,
     send_custom_server_email,
 )
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import Realm, ScheduledEmail, UserProfile
+from zerver.models import Realm, RealmAuditLog, ScheduledEmail, UserProfile
 from zerver.models.realms import get_realm
 from zilencer.models import RemoteZulipServer
 
@@ -233,6 +235,107 @@ class TestCustomEmails(ZulipTestCase):
                 },
             )
             self.assert_length(mail.outbox, 0)
+
+    @staticmethod
+    def send_email_helper(user: UserProfile, template_file: Optional[str] = None) -> str:
+        email_subject = "subject_test"
+        reply_to = "reply_to_test"
+        from_name = "from_name_test"
+        hash_code: str
+        if template_file is not None:
+            _, hash_code = parse_email_template(template_file)
+            send_custom_email(
+                UserProfile.objects.filter(id=user.id),
+                dry_run=False,
+                options={
+                    "markdown_template_path": template_file,
+                    "reply_to": reply_to,
+                    "subject": email_subject,
+                    "from_name": from_name,
+                },
+            )
+        else:
+            with tempfile.NamedTemporaryFile() as markdown_template:
+                random_content = f"test_send_custom_email_event_log{random.random()}"
+                markdown_template.write(random_content.encode())
+                markdown_template.flush()
+                _, hash_code = parse_email_template(markdown_template.name)
+                send_custom_email(
+                    UserProfile.objects.filter(id=user.id),
+                    dry_run=False,
+                    options={
+                        "markdown_template_path": markdown_template.name,
+                        "reply_to": reply_to,
+                        "subject": email_subject,
+                        "from_name": from_name,
+                    },
+                )
+        return hash_code
+
+    def test_send_custom_email_event_log(self) -> None:
+        hamlet = self.example_user("hamlet")
+        hash1 = TestCustomEmails.send_email_helper(hamlet)
+        self.assert_length(mail.outbox, 1)
+        logged_events = RealmAuditLog.objects.filter(
+            realm_id=hamlet.realm.id,
+            event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+            acting_user_id=hamlet.id,
+        )
+        self.assert_length(logged_events, 1)
+        self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash1}")
+        hash2 = TestCustomEmails.send_email_helper(hamlet)
+        self.assert_length(mail.outbox, 2)
+        logged_events = RealmAuditLog.objects.filter(
+            realm_id=hamlet.realm.id,
+            event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+            acting_user_id=hamlet.id,
+        ).order_by("id")
+        self.assert_length(logged_events, 2)
+        self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash1}")
+        self.assertRegex(logged_events[1].extra_data.get("email_id"), rf"{hash2}")
+
+    def test_send_custom_email_event_log_multiple(self) -> None:
+        hamlet = self.example_user("hamlet")
+        hash1 = TestCustomEmails.send_email_helper(hamlet)
+        zoe = self.example_user("ZOE")
+        hash2 = TestCustomEmails.send_email_helper(zoe)
+        self.assert_length(mail.outbox, 2)
+        logged_events = RealmAuditLog.objects.filter(
+            realm_id=hamlet.realm.id,
+            event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+            acting_user_id=hamlet.id,
+        )
+        self.assert_length(logged_events, 1)
+        self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash1}")
+        logged_events = RealmAuditLog.objects.filter(
+            realm_id=zoe.realm.id,
+            event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+            acting_user_id=zoe.id,
+        )
+        self.assert_length(logged_events, 1)
+        self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash2}")
+
+    def test_send_custom_email_event_log_duplicate(self) -> None:
+        hamlet = self.example_user("hamlet")
+        with tempfile.NamedTemporaryFile() as markdown_template:
+            hash1 = TestCustomEmails.send_email_helper(hamlet, markdown_template.name)
+            self.assert_length(mail.outbox, 1)
+            logged_events = RealmAuditLog.objects.filter(
+                realm_id=hamlet.realm.id,
+                event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+                acting_user_id=hamlet.id,
+            )
+            self.assert_length(logged_events, 1)
+            self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash1}")
+            TestCustomEmails.send_email_helper(hamlet, markdown_template.name)
+            self.assert_length(mail.outbox, 1)
+            logged_events = RealmAuditLog.objects.filter(
+                realm_id=hamlet.realm.id,
+                event_type=RealmAuditLog.CUSTOMER_EMAIL_SENT,
+                acting_user_id=hamlet.id,
+            )
+            self.assert_length(logged_events, 1)
+            self.assertRegex(logged_events[0].extra_data.get("email_id"), rf"{hash1}")
 
 
 class TestFollowupEmails(ZulipTestCase):
